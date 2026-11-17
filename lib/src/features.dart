@@ -3,9 +3,11 @@ import 'dart:io';
 
 import 'package:analyzer/dart/analysis/analysis_context_collection.dart';
 import 'package:analyzer/dart/analysis/results.dart';
-import 'package:analyzer/dart/analysis/utilities.dart';
 import 'package:analyzer/dart/ast/ast.dart';
 import 'package:analyzer/dart/ast/visitor.dart';
+import 'package:analyzer/dart/element/element.dart';
+import 'package:analyzer/dart/element/type.dart';
+import 'package:rynsy_rules/src/banned.dart' show packageName;
 import 'package:rynsy_rules/src/finding.dart';
 
 const clientPackage = 'package:service_api/';
@@ -52,10 +54,11 @@ class Proof {
 }
 
 /// What the app does, read from the code: operations of the generated client
-/// called from `lib/`, and the paths of every `GoRoute` in `lib/`.
+/// called from `lib/`, and the paths of every `GoRoute` in `lib/`, each with
+/// the `lib/` files where it appears.
 class Surface {
-  final operations = <String>{};
-  final routes = <String>{};
+  final operations = <String, Set<String>>{};
+  final routes = <String, Set<String>>{};
   final problems = <Finding>[];
 }
 
@@ -88,26 +91,52 @@ String _lowerCamel(String id) {
   return buffer.toString();
 }
 
-Future<Surface> readSurface(String root, Map<String, String> methods) async {
-  final surface = Surface();
-  final targets = trackedFiles(root, [
-    'lib/*.dart',
-    'lib/**/*.dart',
-  ]).where((p) => !p.endsWith('.g.dart')).toList();
-  if (targets.isEmpty) {
-    return surface;
+/// One resolved view of `lib/` and `test/`.
+class Resolved {
+  Resolved(this.root, this.lib, this.tests)
+    : _absolute = Directory(root).absolute.path {
+    final all = [...lib, ...tests];
+    _collection = all.isEmpty
+        ? null
+        : AnalysisContextCollection(
+            includedPaths: [for (final p in all) '$_absolute/$p'],
+          );
   }
-  final absolute = Directory(root).absolute.path;
-  final collection = AnalysisContextCollection(
-    includedPaths: [for (final p in targets) '$absolute/$p'],
+
+  factory Resolved.of(String root) => Resolved(
+    root,
+    trackedFiles(root, ['lib/*.dart', 'lib/**/*.dart']),
+    trackedFiles(root, ['test/*.dart', 'test/**/*.dart']),
   );
-  for (final path in targets) {
-    final file = '$absolute/$path';
+
+  final String root;
+  final List<String> lib;
+  final List<String> tests;
+  final String _absolute;
+  AnalysisContextCollection? _collection;
+
+  Future<ResolvedUnitResult?> unit(String path) async {
+    final collection = _collection;
+    if (collection == null) {
+      return null;
+    }
+    final file = '$_absolute/$path';
     final result = await collection
         .contextFor(file)
         .currentSession
         .getResolvedUnit(file);
-    if (result is! ResolvedUnitResult) {
+    return result is ResolvedUnitResult ? result : null;
+  }
+}
+
+Future<Surface> readSurface(
+  Resolved resolved,
+  Map<String, String> methods,
+) async {
+  final surface = Surface();
+  for (final path in resolved.lib) {
+    final result = await resolved.unit(path);
+    if (result == null) {
       surface.problems.add(Finding(path, 1, 'features', 'could not resolve'));
       continue;
     }
@@ -115,6 +144,15 @@ Future<Surface> readSurface(String root, Map<String, String> methods) async {
   }
   return surface;
 }
+
+bool _isGoRoute(InterfaceElement? element) =>
+    element != null &&
+    element.name == 'GoRoute' &&
+    element.library.uri.toString().startsWith('package:go_router/');
+
+bool _isGoRouteType(InterfaceElement? element) =>
+    _isGoRoute(element) ||
+    (element?.allSupertypes.any((t) => _isGoRoute(t.element)) ?? false);
 
 class _SurfaceVisitor extends RecursiveAstVisitor<void> {
   _SurfaceVisitor(this.path, this.result, this.methods, this.surface);
@@ -126,6 +164,17 @@ class _SurfaceVisitor extends RecursiveAstVisitor<void> {
 
   int _line(AstNode node) =>
       result.lineInfo.getLocation(node.offset).lineNumber;
+
+  void _problem(AstNode node, String message) =>
+      surface.problems.add(Finding(path, _line(node), 'features', message));
+
+  @override
+  void visitMethodInvocation(MethodInvocation node) {
+    if (node.realTarget?.staticType is DynamicType) {
+      _problem(node, 'a dynamic call hides which operation runs');
+    }
+    super.visitMethodInvocation(node);
+  }
 
   @override
   void visitSimpleIdentifier(SimpleIdentifier node) {
@@ -139,55 +188,122 @@ class _SurfaceVisitor extends RecursiveAstVisitor<void> {
       final id = methods[base];
       if (id != null &&
           element?.enclosingElement?.name?.endsWith('Api') == true) {
-        surface.operations.add(id);
+        surface.operations.putIfAbsent(id, () => {}).add(path);
       }
     }
     super.visitSimpleIdentifier(node);
   }
 
+  void _route(AstNode node, ArgumentList arguments, {required bool required}) {
+    final value = arguments.arguments
+        .whereType<NamedArgument>()
+        .where((a) => a.name.lexeme == 'path')
+        .map((a) => a.argumentExpression)
+        .firstOrNull;
+    if (value is SimpleStringLiteral) {
+      surface.routes.putIfAbsent(value.value, () => {}).add(path);
+    } else if (value != null || required) {
+      _problem(node, 'a GoRoute path must be a string literal');
+    }
+  }
+
   @override
   void visitInstanceCreationExpression(InstanceCreationExpression node) {
-    final type = node.constructorName.type.element;
-    if (type?.name == 'GoRoute' &&
-        (type?.library?.uri.toString() ?? '').startsWith(
-          'package:go_router/',
-        )) {
-      final path = node.argumentList.arguments
-          .whereType<NamedArgument>()
-          .where((a) => a.name.lexeme == 'path')
-          .map((a) => a.argumentExpression)
-          .firstOrNull;
-      if (path is SimpleStringLiteral) {
-        surface.routes.add(path.value);
-      } else {
-        surface.problems.add(
-          Finding(
-            this.path,
-            _line(node),
-            'features',
-            'a GoRoute path must be a string literal',
-          ),
-        );
-      }
+    final type = node.staticType;
+    final element = type is InterfaceType ? type.element : null;
+    if (_isGoRouteType(element)) {
+      _route(node, node.argumentList, required: _isGoRoute(element));
     }
     super.visitInstanceCreationExpression(node);
   }
+
+  @override
+  void visitSuperConstructorInvocation(SuperConstructorInvocation node) {
+    if (_isGoRoute(node.element?.enclosingElement)) {
+      _route(node, node.argumentList, required: false);
+    }
+    super.visitSuperConstructorInvocation(node);
+  }
+}
+
+const _assertions = {'expect', 'expectLater', 'fail'};
+const _testLibraries = [
+  'package:matcher/',
+  'package:test_api/',
+  'package:test/',
+  'package:flutter_test/',
+];
+
+bool _fromTestLibrary(Element? element) {
+  final uri = element?.library?.uri.toString() ?? '';
+  return _testLibraries.any(uri.startsWith);
+}
+
+bool _isAssertion(Element? element) =>
+    element is TopLevelFunctionElement &&
+    _assertions.contains(element.name) &&
+    _fromTestLibrary(element);
+
+String? _key(Element? element) => element is TopLevelFunctionElement
+    ? '${element.library.uri}#${element.name}'
+    : null;
+
+/// Top-level functions in the test tree that call a real assertion, directly
+/// or through another such function. Keyed by library and name, so a local
+/// `expect` or a same-named helper elsewhere does not count.
+Future<Set<String>> assertingHelpers(Resolved resolved) async {
+  final calls = <String, Set<String>>{};
+  final asserting = <String>{};
+  for (final path in resolved.tests) {
+    final result = await resolved.unit(path);
+    if (result == null) {
+      continue;
+    }
+    for (final fn
+        in result.unit.declarations.whereType<FunctionDeclaration>()) {
+      final key = _key(fn.declaredFragment?.element);
+      if (key == null) {
+        continue;
+      }
+      final collector = _Calls();
+      fn.accept(collector);
+      if (collector.elements.any(_isAssertion)) {
+        asserting.add(key);
+      }
+      calls
+          .putIfAbsent(key, () => {})
+          .addAll(collector.elements.map(_key).nonNulls);
+    }
+  }
+  var grew = true;
+  while (grew) {
+    grew = false;
+    for (final MapEntry(:key, :value) in calls.entries) {
+      if (!asserting.contains(key) && value.any(asserting.contains)) {
+        asserting.add(key);
+        grew = true;
+      }
+    }
+  }
+  return asserting;
 }
 
 /// Static part: the proof is a `test`/`testWidgets` call with literal names
-/// (groups included), is not skipped, and can fail.
-String? staticProblem(String root, Proof proof, Set<String> assertingHelpers) {
-  final file = File('$root/${proof.file}');
-  if (!file.existsSync()) {
+/// (groups included), is not skipped, and can fail through a real assertion.
+Future<String?> staticProblem(
+  Resolved resolved,
+  Proof proof,
+  Set<String> helpers,
+) async {
+  if (!File('${resolved.root}/${proof.file}').existsSync()) {
     return 'no such file';
   }
-  final unit = parseString(
-    content: file.readAsStringSync(),
-    path: proof.file,
-    throwIfDiagnostics: false,
-  ).unit;
+  final result = await resolved.unit(proof.file);
+  if (result == null) {
+    return 'could not resolve (is it tracked by git?)';
+  }
   final finder = _TestFinder(proof.name);
-  unit.accept(finder);
+  result.unit.accept(finder);
   final found = finder.found;
   if (found == null) {
     return 'no test with exactly this name '
@@ -202,59 +318,50 @@ String? staticProblem(String root, Proof proof, Set<String> assertingHelpers) {
   if (body == null) {
     return 'the test has no body';
   }
-  final calls = _Calls();
-  body.accept(calls);
-  if (calls.names.contains('markTestSkipped')) {
+  final collector = _Calls();
+  body.accept(collector);
+  if (collector.elements.any(
+    (e) => e?.name == 'markTestSkipped' && _fromTestLibrary(e),
+  )) {
     return 'the test can skip itself';
   }
-  if (!calls.names.any(
-    (n) => _assertions.contains(n) || assertingHelpers.contains(n),
+  if (!collector.elements.any(
+    (e) => _isAssertion(e) || helpers.contains(_key(e)),
   )) {
-    return 'the test cannot fail: '
-        'no expect, expectLater, fail or asserting helper';
+    return 'the test cannot fail: no expect, expectLater or fail from the '
+        'test packages, and no helper in test/ that calls one';
   }
   return null;
 }
 
-const _assertions = {'expect', 'expectLater', 'fail'};
-
-/// Top-level functions in the test tree that call an assertion, directly or
-/// through another such function.
-Set<String> assertingHelpers(String root) {
-  final callsByFunction = <String, Set<String>>{};
-  for (final path in trackedFiles(root, ['test/*.dart', 'test/**/*.dart'])) {
-    final unit = parseString(
-      content: File('$root/$path').readAsStringSync(),
-      path: path,
-      throwIfDiagnostics: false,
-    ).unit;
-    for (final fn in unit.declarations.whereType<FunctionDeclaration>()) {
-      final calls = _Calls();
-      fn.accept(calls);
-      callsByFunction.putIfAbsent(fn.name.lexeme, () => {}).addAll(calls.names);
-    }
+/// Every library [path] imports or exports, transitively.
+Future<Set<String>> reachable(Resolved resolved, String path) async {
+  final result = await resolved.unit(path);
+  final start = result?.libraryElement;
+  if (start == null) {
+    return {};
   }
-  final asserting = <String>{};
-  var grew = true;
-  while (grew) {
-    grew = false;
-    for (final MapEntry(:key, :value) in callsByFunction.entries) {
-      if (!asserting.contains(key) &&
-          value.any((n) => _assertions.contains(n) || asserting.contains(n))) {
-        asserting.add(key);
-        grew = true;
-      }
+  final seen = <String>{};
+  final queue = <LibraryElement>[start];
+  while (queue.isNotEmpty) {
+    final library = queue.removeLast();
+    if (!seen.add(library.uri.toString())) {
+      continue;
     }
+    for (final fragment in library.fragments) {
+      queue.addAll(fragment.importedLibraries);
+    }
+    queue.addAll(library.exportedLibraries);
   }
-  return asserting;
+  return seen;
 }
 
 class _Calls extends RecursiveAstVisitor<void> {
-  final names = <String>{};
+  final elements = <Element?>[];
 
   @override
   void visitMethodInvocation(MethodInvocation node) {
-    names.add(node.methodName.name);
+    elements.add(node.methodName.element);
     super.visitMethodInvocation(node);
   }
 }
@@ -405,27 +512,32 @@ Future<List<String>> featureProblems(
   final methods = File('$root/$spec').existsSync()
       ? operationIds('$root/$spec')
       : <String, String>{};
-  final surface = await readSurface(root, methods);
+  final resolved = Resolved.of(root);
+  final surface = await readSurface(resolved, methods);
   problems.addAll(surface.problems.map((f) => f.toString()));
 
   final listedOps = {for (final f in features) ...f.operations};
   final listedRoutes = {for (final f in features) ...f.routes};
-  for (final op in surface.operations.difference(listedOps)) {
+  final calledOps = surface.operations.keys.toSet();
+  final declaredRoutes = surface.routes.keys.toSet();
+  for (final op in calledOps.difference(listedOps)) {
     problems.add('operation $op is called from lib/ but belongs to no feature');
   }
-  for (final route in surface.routes.difference(listedRoutes)) {
+  for (final route in declaredRoutes.difference(listedRoutes)) {
     problems.add('route $route is in lib/ but belongs to no feature');
   }
-  for (final op in listedOps.difference(surface.operations)) {
+  for (final op in listedOps.difference(calledOps)) {
     problems.add('operation $op is listed but lib/ never calls it');
   }
-  for (final route in listedRoutes.difference(surface.routes)) {
+  for (final route in listedRoutes.difference(declaredRoutes)) {
     problems.add('route $route is listed but no GoRoute has this path');
   }
 
+  final package = packageName(root);
+  String uriOf(String libPath) => 'package:$package/${libPath.substring(4)}';
   final names = <String>{};
   final proofs = <Proof>[];
-  final helpers = assertingHelpers(root);
+  final helpers = await assertingHelpers(resolved);
   for (final feature in features) {
     if (!names.add(feature.name)) {
       problems.add('feature "${feature.name}" is listed twice');
@@ -436,20 +548,42 @@ Future<List<String>> featureProblems(
     if (feature.provenBy.isEmpty) {
       problems.add('feature "${feature.name}" names no proving test');
     }
+    final reached = <String>{};
+    var allSound = true;
     for (final text in feature.provenBy) {
       final proof = Proof.parse(text);
       if (proof == null) {
         problems.add(
-          'feature "${feature.name}": "$text" is not test/<file>_test.dart:<full test name>',
+          'feature "${feature.name}": "$text" is not '
+          'test/<file>_test.dart:<full test name>',
         );
+        allSound = false;
         continue;
       }
-      final problem = staticProblem(root, proof, helpers);
+      final problem = await staticProblem(resolved, proof, helpers);
       if (problem != null) {
         problems.add('feature "${feature.name}": $proof: $problem');
+        allSound = false;
         continue;
       }
+      reached.addAll(await reachable(resolved, proof.file));
       proofs.add(proof);
+    }
+    final sites = {
+      for (final op in feature.operations)
+        'operation $op': surface.operations[op] ?? const <String>{},
+      for (final route in feature.routes)
+        'route $route': surface.routes[route] ?? const <String>{},
+    };
+    for (final MapEntry(:key, :value) in sites.entries) {
+      if (allSound &&
+          value.isNotEmpty &&
+          !value.any((f) => reached.contains(uriOf(f)))) {
+        problems.add(
+          'feature "${feature.name}": no proof imports ${value.join(' or ')}, '
+          'where $key is',
+        );
+      }
     }
   }
   if (run && problems.isEmpty) {

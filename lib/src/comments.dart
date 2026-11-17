@@ -10,16 +10,19 @@ import 'package:rynsy_rules/src/finding.dart';
 final _todo = RegExp(r'^// TODO\(#\d+\)');
 final _ponytail = RegExp(r'^// ponytail: \S');
 final _suppression = RegExp(
-  r'^//\s*(ignore\s*:|ignore_for_file\s*:|coverage:ignore)',
+  r'^//+\s*(ignore\s*:|ignore_for_file\s*:|coverage:ignore)',
 );
+
+/// The generated API client, the one tree the rules do not read.
+const generatedClient = 'packages/service_api/';
 
 const continuationLines = 2;
 
-/// Files the comment rule reads: tracked Dart files outside the generated
-/// client (`packages/`) and generated `*.g.dart` parts.
+/// Files the comment rule reads: every tracked Dart file outside the
+/// generated client.
 List<String> commentTargets(String root) => trackedFiles(root, [
   '*.dart',
-]).where((p) => !p.startsWith('packages/') && !p.endsWith('.g.dart')).toList();
+]).where((p) => !p.startsWith(generatedClient)).toList();
 
 List<Finding> commentFindings(String root) => [
   for (final path in commentTargets(root))
@@ -42,6 +45,20 @@ List<Finding> fileCommentFindings(String path, String source) {
   for (final comment in _comments(unit)) {
     final text = comment.lexeme;
     final line = lines.getLocation(comment.offset).lineNumber;
+    if (_suppression.hasMatch(text)) {
+      if (!todoLines.contains(line - 1)) {
+        findings.add(
+          Finding(
+            path,
+            line,
+            'RYD001',
+            'a suppression needs a `// TODO(#<issue>)` on the line directly '
+                'above it',
+          ),
+        );
+      }
+      continue;
+    }
     if (docs.offsets.contains(comment.offset)) {
       continue;
     }
@@ -54,19 +71,6 @@ List<Finding> fileCommentFindings(String path, String source) {
       continue;
     }
     if (allowedLines.contains(line)) {
-      continue;
-    }
-    if (_suppression.hasMatch(text)) {
-      if (!todoLines.contains(line - 1)) {
-        findings.add(
-          Finding(
-            path,
-            line,
-            'RYD001',
-            'a suppression needs a `// TODO(#<issue>)` on the line above it',
-          ),
-        );
-      }
       continue;
     }
     findings.add(

@@ -62,6 +62,7 @@ import 'package:test/test.dart';
 void checkOne(int x) => expect(x, 1);
 ''',
   'test/app_test.dart': '''
+import 'package:app/app.dart';
 import 'package:test/test.dart';
 
 import 'helpers.dart';
@@ -77,14 +78,32 @@ void main() {
       expect(1, 1);
     });
   });
-  test('home', () => expect(1, 1));
+  test('home', () => expect(routes, isNotEmpty));
 }
 ''',
-  'test/broken_test.dart': '''
+  'test/unrelated_test.dart': '''
 import 'package:test/test.dart';
 
 void main() {
-  test('passes', () => expect(1, 1));
+  test('counts', () => expect(1, 1));
+}
+''',
+  'test/shadow_test.dart': '''
+import 'package:app/app.dart';
+import 'package:test/test.dart' hide expect;
+
+void expect(Object? a, Object? b) {}
+
+void main() {
+  test('never fails', () => expect(routes, 2));
+}
+''',
+  'test/broken_test.dart': '''
+import 'package:app/app.dart';
+import 'package:test/test.dart';
+
+void main() {
+  test('passes', () => expect(routes, isNotEmpty));
   test('fails', () => expect(1, 2));
 }
 ''',
@@ -107,9 +126,11 @@ List<Map<String, Object>> features(List<String> items, List<String> home) => [
 Future<List<String>> problemsFor(
   List<Map<String, Object>> features, {
   bool run = true,
+  Map<String, String> extra = const {},
 }) async {
   final root = fixture({
     ...app,
+    ...extra,
     'openapi/openapi.json': jsonEncode(spec),
     'features.json': jsonEncode(features),
   });
@@ -170,6 +191,68 @@ void main() {
       contains('no such file'),
       contains('is not test/<file>_test.dart:<full test name>'),
     ]);
+  });
+
+  test('a proof must import where its operations and routes are', () async {
+    final problems = await problemsFor(
+      features(
+        ['test/unrelated_test.dart:counts'],
+        ['test/app_test.dart:home'],
+      ),
+      run: false,
+    );
+    expect(problems, [
+      contains('no proof imports lib/app.dart, where operation listItems is'),
+      contains('no proof imports lib/app.dart, where operation create-item is'),
+      contains('no proof imports lib/app.dart, where route /items is'),
+    ]);
+  });
+
+  test('a local expect is not an assertion', () async {
+    final problems = await problemsFor(
+      features(
+        ['test/shadow_test.dart:never fails'],
+        ['test/app_test.dart:home'],
+      ),
+      run: false,
+    );
+    expect(problems, [contains('cannot fail')]);
+  });
+
+  test('routes behind aliases and subclasses, and dynamic calls', () async {
+    final problems = await problemsFor(
+      features(['test/app_test.dart:items list'], ['test/app_test.dart:home']),
+      run: false,
+      extra: {
+        'lib/hidden.dart': '''
+import 'package:go_router/go_router.dart';
+import 'package:service_api/api.dart';
+
+typedef Page = GoRoute;
+
+class SecretRoute extends GoRoute {
+  SecretRoute() : super(path: '/secret');
+}
+
+class PassRoute extends GoRoute {
+  PassRoute({required super.path});
+}
+
+final hidden = [Page(path: '/alias'), SecretRoute(), PassRoute(path: '/pass')];
+
+Future<Object?> sneak(DefaultApi api) => (api as dynamic).healthz();
+''',
+      },
+    );
+    expect(
+      problems,
+      unorderedEquals(<Object>[
+        contains('a dynamic call hides which operation runs'),
+        'route /alias is in lib/ but belongs to no feature',
+        'route /secret is in lib/ but belongs to no feature',
+        'route /pass is in lib/ but belongs to no feature',
+      ]),
+    );
   });
 
   test('a proof fails when anything in its file fails', () async {
