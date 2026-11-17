@@ -1,0 +1,24 @@
+# The shared analyzer config for every app built from flutter-app-template.
+# An app's analysis_options.yaml is exactly:
+#   include: package:rynsy_rules/analysis_options.yaml
+# and `rynsy_rules check` rejects anything else (RYD003).
+include: package:very_good_analysis/analysis_options.yaml
+
+analyzer:
+  language:
+    strict-casts: true
+    strict-inference: true
+    strict-raw-types: true
+  exclude:
+    - packages/**
+    - "**/*.g.dart"
+    - build/**
+    - android/**
+    - web/**
+
+linter:
+  rules:
+    always_use_package_imports: true
+    prefer_relative_imports: false
+    public_member_api_docs: false
+    unnecessary_type_name_in_constructor: false
