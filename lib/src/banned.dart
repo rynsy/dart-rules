@@ -7,26 +7,39 @@ import 'package:analyzer/dart/ast/visitor.dart';
 import 'package:analyzer/dart/element/element.dart';
 import 'package:analyzer/source/line_info.dart';
 import 'package:rynsy_rules/src/finding.dart';
+import 'package:yaml/yaml.dart';
 
 /// `library uri` -> `Class.member` (or a top-level name) that reads the wall
 /// clock or blocks the isolate. Product code gets time from an injected clock.
+/// A banned constructor is banned for every subclass too.
 const banned = {
   'dart:core': {'DateTime.now', 'DateTime.timestamp', 'Stopwatch.new'},
   'dart:io': {'sleep'},
+  'dart:developer': {'Timeline.now'},
 };
 
 const _exempt = {'lib/main.dart'};
 
-List<String> bannedTargets(String root) => trackedFiles(
-  root,
-  ['lib/*.dart', 'lib/**/*.dart'],
-).where((p) => !_exempt.contains(p) && !p.endsWith('.g.dart')).toSet().toList();
+List<String> bannedTargets(String root) => trackedFiles(root, [
+  'lib/*.dart',
+  'lib/**/*.dart',
+]).where((p) => !_exempt.contains(p)).toSet().toList();
+
+String? packageName(String root) {
+  final pubspec = File('$root/pubspec.yaml');
+  if (!pubspec.existsSync()) {
+    return null;
+  }
+  final doc = loadYaml(pubspec.readAsStringSync());
+  return doc is Map ? doc['name'] as String? : null;
+}
 
 Future<List<Finding>> bannedFindings(String root) async {
   final targets = bannedTargets(root);
   if (targets.isEmpty) {
     return [];
   }
+  final mainUri = 'package:${packageName(root)}/main.dart';
   final absolute = Directory(root).absolute.path;
   final collection = AnalysisContextCollection(
     includedPaths: [for (final p in targets) '$absolute/$p'],
@@ -45,6 +58,24 @@ Future<List<Finding>> bannedFindings(String root) async {
     final visitor = _BannedUses(path, result.lineInfo);
     result.unit.accept(visitor);
     findings.addAll(visitor.findings);
+    final here = Uri.parse('package:${packageName(root)}/${path.substring(4)}');
+    for (final directive in result.unit.directives) {
+      final text = directive is NamespaceDirective
+          ? directive.uri.stringValue
+          : null;
+      final imported = text == null ? null : here.resolve(text).toString();
+      if (imported == mainUri) {
+        findings.add(
+          Finding(
+            path,
+            result.lineInfo.getLocation(directive.offset).lineNumber,
+            'RYD002',
+            'lib/main.dart is the composition root and may read the clock; '
+                'nothing in lib/ imports it',
+          ),
+        );
+      }
+    }
   }
   return findings;
 }
@@ -53,22 +84,38 @@ String? bannedName(Element? element) {
   if (element == null) {
     return null;
   }
-  final library = element.library?.uri.toString();
-  final names = banned[library];
-  if (names == null) {
-    return null;
-  }
-  final String name;
   if (element is ConstructorElement) {
+    final owner = element.enclosingElement;
     final ctor = element.name ?? 'new';
-    name = '${element.enclosingElement.name}.${ctor.isEmpty ? 'new' : ctor}';
-  } else if (element is TopLevelFunctionElement) {
-    name = element.name ?? '';
-  } else {
+    final own = '${owner.name}.${ctor.isEmpty ? 'new' : ctor}';
+    if (_isBanned(owner.library.uri.toString(), own)) {
+      return own;
+    }
+    for (final type in owner.allSupertypes) {
+      final name = '${type.element.name}.new';
+      if (_isBanned(type.element.library.uri.toString(), name)) {
+        return '$name (through ${owner.name})';
+      }
+    }
     return null;
   }
-  return names.contains(name) ? name : null;
+  final library = element.library?.uri.toString() ?? '';
+  if (element is TopLevelFunctionElement) {
+    final name = element.name ?? '';
+    return _isBanned(library, name) ? name : null;
+  }
+  if (element is ExecutableElement) {
+    final owner = element.enclosingElement;
+    if (owner is InterfaceElement) {
+      final name = '${owner.name}.${element.name}';
+      return _isBanned(library, name) ? name : null;
+    }
+  }
+  return null;
 }
+
+bool _isBanned(String library, String name) =>
+    banned[library]?.contains(name) ?? false;
 
 class _BannedUses extends RecursiveAstVisitor<void> {
   _BannedUses(this.path, this.lines);
@@ -98,6 +145,12 @@ class _BannedUses extends RecursiveAstVisitor<void> {
   void visitConstructorName(ConstructorName node) {
     _check(node, node.element);
     super.visitConstructorName(node);
+  }
+
+  @override
+  void visitSuperConstructorInvocation(SuperConstructorInvocation node) {
+    _check(node, node.element);
+    super.visitSuperConstructorInvocation(node);
   }
 
   @override

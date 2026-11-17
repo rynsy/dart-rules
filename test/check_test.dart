@@ -80,6 +80,32 @@ void _b() {}
       );
     });
 
+    test('a ponytail continuation or a doc comment cannot suppress', () {
+      expect(
+        commentLines('''
+// ponytail: x
+// ignore_for_file: avoid_print
+// prose
+/// Shouts.
+/// ignore: avoid_print
+void shout() {}
+'''),
+        [2, 5],
+      );
+    });
+
+    test('generated-looking files get no exemption', () {
+      final root = fixture({
+        'lib/clock.g.dart': '// anything\n',
+        'packages/evil/lib/evil.dart': '// anything\n',
+        'packages/service_api/lib/api.dart': '// generated\n',
+      });
+      expect(commentFindings(root).map((f) => f.path), [
+        'lib/clock.g.dart',
+        'packages/evil/lib/evil.dart',
+      ]);
+    });
+
     test('comments inside strings are not comments', () {
       expect(commentLines("const s = '// not a comment';\n"), isEmpty);
     });
@@ -105,6 +131,18 @@ import 'dart:core' as core;
 final b = core.DateTime.now();
 final ok = core.DateTime(2020);
 ''',
+        'lib/c.dart': '''
+import 'dart:developer';
+
+import 'package:app/main.dart';
+
+class Watch extends Stopwatch {}
+
+final w = Watch();
+final t = Timeline.now;
+''',
+        'lib/clock.g.dart': 'final now = DateTime.now();\n',
+        'pubspec.yaml': 'name: app\n',
         'lib/main.dart': 'final now = DateTime.now();\n',
         'test/a_test.dart': 'final now = DateTime.now();\n',
       });
@@ -117,6 +155,10 @@ final ok = core.DateTime(2020);
         'lib/a.dart:7',
         'lib/a.dart:8',
         'lib/b.dart:3',
+        'lib/c.dart:7',
+        'lib/c.dart:8',
+        'lib/c.dart:3',
+        'lib/clock.g.dart:1',
       ]);
     });
   });
@@ -136,12 +178,57 @@ final ok = core.DateTime(2020);
             'linter:\n  rules:\n    avoid_print: false\n',
         'lib/analysis_options.yaml': 'include: $sharedInclude\n',
         'packages/service_api/analysis_options.yaml': 'linter:\n',
+        'packages/evil/analysis_options.yaml': 'linter:\n',
       });
       expect(optionsFindings(local).map((f) => f.path), [
         'analysis_options.yaml',
         'lib/analysis_options.yaml',
+        'packages/evil/analysis_options.yaml',
       ]);
       expect(optionsFindings(fixture({'a.txt': ''})), hasLength(1));
+    });
+
+    test('the pubspec cannot swap the checker', () {
+      const good =
+          '''
+name: app
+dev_dependencies:
+  rynsy_rules:
+    git:
+      url: $rulesUrl
+      ref: v0.2.0
+  service_api:
+    path: packages/service_api
+''';
+      List<String> messages(Map<String, String> files) => optionsFindings(
+        fixture({
+          'analysis_options.yaml': 'include: $sharedInclude\n',
+          ...files,
+        }),
+      ).map((f) => f.message).toList();
+
+      expect(messages({'pubspec.yaml': good}), isEmpty);
+      expect(
+        messages({
+          'pubspec.yaml':
+              '${good}dependency_overrides:\n  rynsy_rules:\n    path: x\n',
+        }),
+        [contains('dependency_overrides')],
+      );
+      expect(
+        messages({'pubspec.yaml': good, 'pubspec_overrides.yaml': 'x: 1\n'}),
+        [contains('pubspec_overrides.yaml')],
+      );
+      expect(
+        messages({
+          'pubspec.yaml': good.replaceFirst(rulesUrl, 'https://e.com/f.git'),
+        }),
+        [contains('rynsy_rules must be')],
+      );
+      expect(
+        messages({'pubspec.yaml': '$good  evil:\n    path: packages/evil\n'}),
+        [contains('evil is a path dependency')],
+      );
     });
   });
 }
